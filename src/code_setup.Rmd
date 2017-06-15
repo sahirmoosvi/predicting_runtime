@@ -1,0 +1,232 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+
+library(tidyverse)
+library(nycflights13)
+library(geosphere)
+library(stringr)
+library(lubridate)
+
+```
+
+
+
+This chunk creates intervals for the flights to fall under
+```{r}
+
+intervals <- tibble(
+  min_interval = seq(00, 2359, 100),
+  max_interval = seq(59, 2359, 100)
+)
+
+intervals$max_interval[intervals$max_interval == 2359] = 2400
+
+intervals <- intervals %>% 
+  mutate(min_interval = str_pad(intervals$min_interval, 4, "left", 0),
+         max_interval = str_pad(intervals$max_interval, 4, "left", 0)) %>% 
+  
+  mutate(combined = paste0(min_interval,"-",max_interval))
+
+```
+
+
+
+This massages the flights df into something usable by my app with minimal work.
+
+```{r}
+
+## from_timing_point = origin
+## to_timing_point = dest
+## route = carrier
+
+new_flights <- flights %>% 
+  mutate(time_hour = ymd_hms(time_hour)) %>% 
+  mutate(service_week = wday(time_hour)) %>% 
+  mutate(service_type_code = ifelse(service_week == 1, "SUN", ifelse(service_week == 7, "SAT", "MF"))) 
+
+standardized_flights <- inner_join(new_flights, select(airports, faa, tz), by = c('origin' = 'faa')) %>% 
+  inner_join(select(airports, faa, tz), by = c('dest' = 'faa')) %>% 
+  mutate(from_tz = tz.x,
+         to_tz = tz.y)
+
+
+new_std_flights <- standardized_flights %>%
+  mutate(sched_dep_time_sec = (sched_dep_time %/% 100)*60*60 + (sched_dep_time %% 100)*60 + from_tz*60*60 ) %>% 
+  mutate(sched_arr_time_sec = (sched_arr_time %/% 100)*60*60 + (sched_arr_time %% 100)*60 + to_tz*60*60 ) %>% 
+  mutate(dep_time_sec = (dep_time %/% 100)*60*60 + (dep_time %% 100)*60 + from_tz*60*60) %>% 
+  mutate(arr_time_sec = (arr_time %/% 100)*60*60 + (arr_time %% 100)*60 + to_tz*60*60) %>% 
+  mutate(sch_rt = abs(sched_dep_time_sec - sched_arr_time_sec)) %>% 
+  mutate(act_rt = abs(dep_time_sec - arr_time_sec))
+  
+
+```
+
+```{r}
+getSeason <- function(input.date){
+  numeric.date <- 100*month(input.date)+day(input.date)
+  ## input Seasons upper limits in the form MMDD in the "break =" option:
+  cuts <- base::cut(numeric.date, breaks = c(0,319,0620,0921,1220,1231)) 
+  # rename the resulting groups (could've been done within cut(...levels=) if "Winter" wasn't double
+  levels(cuts) <- c("Winter","Spring","Summer","Fall","Winter")
+  return(cuts)
+}
+
+# Function courtesy of https://stackoverflow.com/questions/36502140/determine-season-from-date-using-lubridate-in-r#36518085
+
+
+season_dates <- tibble(
+  season = c("Winter","Spring","Summer","Fall"),
+  min_date = ymd_hms(c("2013-12-20 00:00:00", "2013-03-19 00:00:00", "2013-06-20 00:00:00", "2013-09-21 00:00:00")),
+  max_date = ymd_hms(c("2013-03-18 12:59:59", "2013-06-19 12:59:59", "2013-09-20 12:59:59", "2013-12-19 12:59:59")) )
+
+```
+
+
+```{r}
+
+new_std_flights <- new_std_flights %>% 
+  mutate(season = getSeason(time_hour))
+
+```
+
+
+
+Group into intervals by hour
+```{r}
+suppressWarnings(computed_intervals <- unlist(map(.x = new_std_flights$dep_time, .f = function(x) intervals$combined[min(which(x < as.numeric(intervals$max_interval)))] )))
+
+new_std_flights$interval <- computed_intervals
+```
+
+
+This creates a dataframe of all existing combinations of from and to airports and get's both lat and lons.
+```{r}
+
+unique_paths <- unique(flights[,c('origin','dest')])
+
+pre_direc <- inner_join(unique_paths, select(airports, faa, lat, lon), by = c('origin' =  'faa')) %>% 
+  inner_join( select(airports, faa, lat, lon), by = c('dest' =  'faa')) 
+
+```
+
+Now we can figure out what the general direction of the flight is going. We first find the initial angle of the flight and then attribute to them cardinal directions.
+
+```{r}
+
+
+pre_direc$angle <- bearingRhumb(p1 = as.matrix(tibble(pre_direc$lon.x, pre_direc$lat.x)), 
+             p2 = as.matrix(tibble(pre_direc$lon.y, pre_direc$lat.y)))
+
+
+dir_sequence <- seq(-22.5,360, 45)
+
+
+coversion_table <- tibble(start = dir_sequence, 
+       end = lead(dir_sequence, default = 360),
+       direction_name = c("E","NE","N","NW","W","SW","S","SE","E"))
+
+suppressWarnings(computed_direction <- unlist(map(.x = pre_direc$angle, .f = function(x) coversion_table$direction_name[min(which(x < as.numeric(coversion_table$end)))] )))
+
+pre_direc$direction_name <- computed_direction
+```
+
+Now that we know what direction a flight will be going we want to attach that to the flights people might take. But we don't really care to attributed a direction to each entry, just to each unique one .
+
+SELECT distinct line_no, direction_name, service_type_code, from_timing_point, to_timing_point,
+
+```{r}
+
+flight_options <- new_std_flights %>% 
+  group_by(origin, dest, service_type_code, carrier, interval) %>% 
+  summarise_each(funs(first)) %>% 
+  ungroup() %>% 
+  left_join(pre_direc) %>% 
+  select(origin, dest, service_type_code, carrier, interval, direction_name)
+
+
+```
+
+save this data for use in the app in the future. In the future we want to add more years worth of data.
+```{r}
+save(flight_options, file = "../data/flight_options.rda")
+```
+
+
+to create historical predictions
+```{r}
+
+flight_history <- new_std_flights %>% 
+  group_by(origin, dest, service_type_code, carrier, interval, season) %>% 
+  summarise(sch_rt = mean(sch_rt),
+            mean_act_rt = mean(act_rt, na.rm = TRUE),
+            median_act_rt = median(act_rt, na.rm = TRUE)
+            ) %>% 
+  ungroup() %>% 
+  left_join(pre_direc) %>% 
+  select(origin, dest, service_type_code, carrier, interval, season, direction_name, sch_rt, mean_act_rt, median_act_rt)
+
+flight_history <- left_join(flight_history, season_dates, by = 'season')
+
+```
+
+
+```{r}
+
+to_minutes <- 60
+
+
+fh <- flight_history %>% 
+  filter(origin == "EWR",
+         dest == "ALB",
+         service_type_code == "MF",
+         carrier == "EV",
+         interval == "0700-0759",
+         direction_name == "E"
+         ) %>% 
+  gather("minormax", "date", min_date, max_date)
+
+save(fh, file = "../data/fh.rda")
+      
+
+```
+
+
+
+```{r}
+ggplot(data = fh) +
+          geom_line(aes(x = date, y = sch_rt/to_minutes, color = I("#3019ff") ), linetype = "dashed") +
+  geom_line(aes(x = date, y = mean_act_rt/to_minutes, color = I("#3019ff") ), linetype = "solid") 
+
+```
+
+
+
+
+
+
+```{r}
+flights_use <- new_std_flights %>% 
+  select(origin,dest,service_type_code, sch_rt, act_rt, carrier, interval)
+```
+
+
+
+
+
+
+
+
+
+
+
+to grab more data use hadley's code here and update year: https://github.com/hadley/nycflights13/blob/master/data-raw/flights.R
+
+
+
+
+
+
